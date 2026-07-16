@@ -1,20 +1,21 @@
 """
-chainstate-priors — nightly corpus ingester for CHAINSTATE v0.7.0
+chainstate-priors — nightly corpus ingester for CHAINSTATE v0.7.1
 
-Pulls fresh content from four source families and writes empirical
+Pulls fresh content from FIVE source families and writes empirical
 symbol distributions + semantic embeddings into Cloudflare KV, where
 the CHAINSTATE worker can consult them as priors during query handling.
 
 Sources:
   1. Wikipedia (English)  — /api/rest_v1/page/summary of a curated topic set
   2. arXiv                — recent abstracts from cs.LG, cs.AI, math.CO, quant-ph
-  3. Ecosystem HF Spaces  — the eight+ Spaces that link out from NWO Agentic:
-     nwo-agentic, nwo-chainstate, ornith-chainstate, chainstate-chat,
-     nwo-neuro, nwo-genetic, nwo-blackbox, nwo-cardiac, nwo-geohack,
-     nwo-mr, ornith-mr, ornith, nwo-anon, publicae, metastate
+  3. Ecosystem HF Spaces  — the Spaces that link out from NWO Agentic
   4. ResearchGate         — publication summaries via public search
-     (Casimir-Sonoluminescence, CHAINSTATE, CHAINSTATE CODE, ASI-Evolve,
-      NWO-ASM, Distributed LM Agent, and any others you add)
+  5. agent.md files       — NEW in v0.7.1 · pulls agent.md from every ecosystem
+                            Space so the substrate discovers its own tool
+                            surface (endpoints, capabilities, allow-listed
+                            behaviors) in its priors corpus. No natural-language
+                            instruction needed — the reflect loop can extend
+                            from an agent.md prior via G_prior.
 
 For each ingested item we compute:
   • 384-dim embedding via chainstate-encoder
@@ -27,11 +28,10 @@ And write to Cloudflare KV under two prefixes:
   vec:{source}:{slug}    →  { vec: [384 floats], ts }
 
 The CHAINSTATE worker has new endpoints /priors/query and /priors/list
-that read from these prefixes (see worker patch in this delivery).
+that read from these prefixes.
 
-Runs as a Render Background Worker with a schedule of `0 3 * * *`
-(daily at 03:00 UTC — off-peak, gentle on arXiv & Wikipedia mirrors).
-Can also be triggered manually via GET /run (auth-gated).
+Runs as a Render Cron Job of `0 3 * * *` (daily at 03:00 UTC).
+Can also be triggered manually via POST /run (auth-gated with RUN_TOKEN).
 
 Env vars required:
   ENCODER_URL          → https://chainstate-encoder.onrender.com
@@ -40,6 +40,11 @@ Env vars required:
   CLOUDFLARE_API_TOKEN → API token with KV write permission
   ENCODER_API_KEY      → optional; forwarded to encoder if set
   RUN_TOKEN            → bearer token required to trigger /run manually
+
+Env vars optional (v0.7.1):
+  INGEST_AGENT_MD_SPACES → comma-separated list "owner/repo:file,owner/repo:file"
+                           to override the default agent.md space list.
+                           filename defaults to "agent.md" if omitted.
 
 Owner: Ciprian Florin Pater
 """
@@ -56,7 +61,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.responses import JSONResponse
 
-SERVICE_VER  = "0.7.0-priors-2026-07-15"
+SERVICE_VER  = "0.7.1-priors-agent-md-2026-07-16"
 ENCODER_URL  = os.getenv("ENCODER_URL",  "https://chainstate-encoder.onrender.com").rstrip("/")
 CF_ACCOUNT   = os.getenv("CLOUDFLARE_ACCOUNT_ID",  "")
 CF_KV_NS     = os.getenv("CLOUDFLARE_KV_NAMESPACE_ID",  "")
@@ -120,7 +125,6 @@ class CFKV:
         return r.status_code, r.text[:200]
 
     async def bulk_put(self, client: httpx.AsyncClient, items: list, ttl_seconds: Optional[int] = None):
-        # items: [{ "key": str, "value": str }]
         url = f"{self.base}/bulk"
         payload = []
         for item in items:
@@ -149,33 +153,24 @@ async def embed(client: httpx.AsyncClient, text: str) -> Optional[list]:
         return None
     return None
 
-# ─── Source: Wikipedia REST v1 summary ──────────────────────────────────
+# ─── Source: Wikipedia REST v1 summary (unchanged from v0.7.0) ──────────
 WIKIPEDIA_TOPICS = [
-    # Symbol / semiotics / language
     "Symbol", "Semiotics", "Sign_(semiotics)", "Umberto_Eco", "Charles_Sanders_Peirce",
     "Linguistics", "Cognitive_linguistics",
-    # Math foundations of what CHAINSTATE routes as math subspace
     "Set_theory", "Category_theory", "Homotopy_type_theory", "Godel's_incompleteness_theorems",
     "Symbolic_computation", "Algorithmic_information_theory", "Kolmogorov_complexity",
-    # Science subspace
     "Casimir_effect", "Sonoluminescence", "Zero-point_energy", "Quantum_field_theory",
     "Bell's_theorem", "Bayesian_inference", "Free_energy_principle",
-    # Consensus / distributed systems
     "Byzantine_fault_tolerance", "Distributed_consensus", "Blockchain", "Merkle_tree",
     "Directed_acyclic_graph", "Consensus_(computer_science)",
-    # AI / cognition / AGI
     "Artificial_general_intelligence", "Reinforcement_learning_from_human_feedback",
     "Transformer_(deep_learning_architecture)", "Attention_(machine_learning)",
     "Mixture_of_experts", "Sparse_representation", "Symbolic_artificial_intelligence",
     "Neurosymbolic_AI", "Genetic_programming", "Program_synthesis",
-    # Modal logic
     "Modal_logic", "Kripke_semantics", "Deontic_logic", "Epistemic_logic",
     "Doxastic_logic", "Dynamic_logic_(modal_logic)",
-    # Occult / esoteric (occ subspace)
     "Alchemy", "Hermeticism", "Kabbalah", "I_Ching", "Astrology", "Sacred_geometry",
-    # Cryptography
     "SHA-3", "Elliptic-curve_cryptography", "Zero-knowledge_proof",
-    # Sovereignty / governance
     "Digital_nation_state", "Network_state", "Sovereignty", "Autonomous_organization",
 ]
 
@@ -184,7 +179,7 @@ async def ingest_wikipedia(client: httpx.AsyncClient, kv: CFKV) -> int:
     for topic in WIKIPEDIA_TOPICS:
         try:
             url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{topic}"
-            r = await client.get(url, headers={"User-Agent": "chainstate-priors/0.7"}, timeout=15.0)
+            r = await client.get(url, headers={"User-Agent": "chainstate-priors/0.7.1"}, timeout=15.0)
             if r.status_code != 200:
                 continue
             data = r.json()
@@ -211,12 +206,12 @@ async def ingest_wikipedia(client: httpx.AsyncClient, kv: CFKV) -> int:
                 await kv.put(client, f"vec:wikipedia:{key_id}",
                              json.dumps({"vec": vec, "ts": record["ts"]}), ttl_seconds=7*86400)
             count += 1
-            await asyncio.sleep(0.2)  # gentle
+            await asyncio.sleep(0.2)
         except Exception as e:
             print(f"[wikipedia] {topic}: {e}", flush=True)
     return count
 
-# ─── Source: arXiv recent listings ──────────────────────────────────────
+# ─── Source: arXiv recent listings (unchanged from v0.7.0) ──────────────
 ARXIV_CATEGORIES = ["cs.LG", "cs.AI", "cs.CL", "cs.DC", "cs.CR", "math.CO", "math.LO", "quant-ph"]
 
 async def ingest_arxiv(client: httpx.AsyncClient, kv: CFKV, per_cat: int = 5) -> int:
@@ -257,7 +252,6 @@ async def ingest_arxiv(client: httpx.AsyncClient, kv: CFKV, per_cat: int = 5) ->
     return count
 
 def _parse_arxiv_atom(xml_text: str) -> list:
-    # Minimal Atom parser — avoids feedparser dep
     items = []
     entries = re.split(r"<entry>", xml_text)[1:]
     for entry in entries:
@@ -271,9 +265,8 @@ def _parse_arxiv_atom(xml_text: str) -> list:
             items.append({"title": title, "summary": summary, "id": id_})
     return items
 
-# ─── Source: Ecosystem HF Spaces (linked from nwo-agentic index.html) ──
+# ─── Source: Ecosystem HF Spaces (unchanged from v0.7.0) ────────────────
 ECOSYSTEM_HF_SPACES = [
-    # Format: (slug, human_title, description)
     ("nwo-agentic",       "NWO Agentic",       "Multi-agent orchestration hub for the NWO ecosystem — links to all Spaces below"),
     ("chainstate",        "CHAINSTATE",        "Symbolic-weight blockchain on Base mainnet 8453 — 65,536-dim symbol space, six subspaces, reputation-weighted Bayesian log-pooling"),
     ("ornith-chainstate", "Ornith × CHAINSTATE","Ornith-1.0 (9B/35B/397B MoE) coding agent × CHAINSTATE — builder, terminal, agent, simulation, AGI dashboard with ASI-Evolve loop"),
@@ -299,7 +292,6 @@ HF_USER = "CPater"
 async def ingest_ecosystem_spaces(client: httpx.AsyncClient, kv: CFKV) -> int:
     count = 0
     for hf_slug, title, description in ECOSYSTEM_HF_SPACES:
-        # Try to fetch the space's own metadata via HF API
         summary_text = f"{title}. {description}"
         space_url = f"https://huggingface.co/spaces/{HF_USER}/{hf_slug}"
         try:
@@ -327,7 +319,6 @@ async def ingest_ecosystem_spaces(client: httpx.AsyncClient, kv: CFKV) -> int:
             "ingester_version": SERVICE_VER,
         }
         key_id = slug(hf_slug)
-        # Ecosystem priors are relatively stable — TTL 30 days (or set no TTL)
         await kv.put(client, f"prior:ecosystem:{key_id}", json.dumps(record), ttl_seconds=30*86400)
         if vec:
             await kv.put(client, f"vec:ecosystem:{key_id}",
@@ -336,10 +327,7 @@ async def ingest_ecosystem_spaces(client: httpx.AsyncClient, kv: CFKV) -> int:
         await asyncio.sleep(0.1)
     return count
 
-# ─── Source: ResearchGate publications (Ciprian Florin Pater's corpus) ─
-# ResearchGate doesn't have a stable public API, but the publication
-# summary pages are cacheable HTML. We seed with your DOIs / RG IDs
-# and fetch the abstract from the page. Structured summaries below.
+# ─── Source: ResearchGate publications (unchanged from v0.7.0) ─────────
 RESEARCHGATE_PUBLICATIONS = [
     {
         "rg_id": "407489249",
@@ -409,7 +397,6 @@ async def ingest_researchgate(client: httpx.AsyncClient, kv: CFKV) -> int:
                 "ingester_version": SERVICE_VER,
             }
             key_id = slug(pub["rg_id"])
-            # Author's own corpus — long TTL (90d)
             await kv.put(client, f"prior:researchgate:{key_id}", json.dumps(record), ttl_seconds=90*86400)
             if vec:
                 await kv.put(client, f"vec:researchgate:{key_id}",
@@ -420,6 +407,171 @@ async def ingest_researchgate(client: httpx.AsyncClient, kv: CFKV) -> int:
             print(f"[researchgate] {pub['rg_id']}: {e}", flush=True)
     return count
 
+# ═══════════════════════════════════════════════════════════════════════
+# v0.7.1 · NEW SOURCE · agent_md
+# ═══════════════════════════════════════════════════════════════════════
+# Ingests agent.md files from every ecosystem HF Space, so the substrate
+# discovers its own tool surface (endpoints, capabilities, allow-listed
+# behaviors) as first-class content in the priors corpus.
+#
+# The reflect loop's G_prior branch then extends from an agent.md prior
+# to a follow-up query about the described endpoints — no natural-language
+# instruction needed to steer the substrate into enumerating available
+# tools. Discovery becomes a property of the corpus.
+# ─────────────────────────────────────────────────────────────────────────
+
+# Default list: (owner, repo, filename). Overridden by env INGEST_AGENT_MD_SPACES.
+AGENT_MD_DEFAULTS = [
+    ("CPater", "nwo-agentic",       "agent.md"),
+    ("CPater", "nwo.apocalypse",    "agent.md"),
+    ("CPater", "nwo-gateway",       "agent.md"),
+    ("CPater", "nwo-blackbox",      "agent.md"),
+    ("CPater", "nwo-anon",          "agent.md"),
+    ("CPater", "nwo-neuro",         "agent.md"),
+    ("CPater", "nwo-cardiac",       "agent.md"),
+    ("CPater", "nwo-asm",           "agent.md"),
+    ("CPater", "nwo-oracle",        "agent.md"),
+    ("CPater", "nwo-zeropoint",     "agent.md"),
+    ("CPater", "nwo-coanda",        "agent.md"),
+    ("CPater", "nwo-ubi",           "agent.md"),
+    ("CPater", "nwo-asi",           "agent.md"),
+    ("CPater", "metastate",         "agent.md"),
+    ("CPater", "imperium-romanum",  "agent.md"),
+    ("CPater", "nwo-capital",       "agent.md"),
+    ("CPater", "ornith-chainstate", "AGENT.md"),
+    ("CPater", "nwo-rwa",           "agent.md"),
+    ("CPater", "nwo-mixed-reality", "agent.md"),
+]
+
+AGENT_MD_MAX_BYTES  = 500_000     # 500 KB body cap (same as worker FETCH)
+AGENT_MD_STRIP_MAX  = 20_000      # 20 KB post-strip cap before encoder
+AGENT_MD_TTL        = 30 * 86400  # 30 days — agent.md changes rarely
+
+def _parse_agent_md_env() -> list:
+    """Parse INGEST_AGENT_MD_SPACES env, fall back to defaults."""
+    raw = os.getenv("INGEST_AGENT_MD_SPACES", "").strip()
+    if not raw:
+        return AGENT_MD_DEFAULTS
+    result = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        # "owner/repo:file" or "owner/repo"
+        if ":" in entry:
+            path_part, fname = entry.rsplit(":", 1)
+        else:
+            path_part, fname = entry, "agent.md"
+        if "/" not in path_part:
+            print(f"[agent_md] skipping malformed entry: {entry!r}", flush=True)
+            continue
+        owner, repo = path_part.split("/", 1)
+        result.append((owner.strip(), repo.strip(), fname.strip()))
+    return result or AGENT_MD_DEFAULTS
+
+def _agent_md_summary(text: str, max_len: int = 500) -> str:
+    """Extract first non-empty prose section after any YAML frontmatter."""
+    # Strip YAML frontmatter
+    if text.lstrip().startswith("---"):
+        m = re.search(r"^---\s*\n.*?\n---\s*\n", text, re.DOTALL | re.MULTILINE)
+        if m:
+            text = text[m.end():]
+    # Skip markdown headings, blockquotes, code fences
+    prose_lines = []
+    in_code = False
+    for ln in text.split("\n"):
+        s = ln.strip()
+        if s.startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code:
+            continue
+        if not s or s.startswith("#") or s.startswith(">"):
+            continue
+        prose_lines.append(s)
+        if len(" ".join(prose_lines)) > max_len * 2:
+            break
+    out = re.sub(r"\s+", " ", " ".join(prose_lines)).strip()
+    return out[:max_len]
+
+async def ingest_agent_md(client: httpx.AsyncClient, kv: CFKV) -> int:
+    """
+    v0.7.1 · Fetch each Space's agent.md from HF /resolve/main/, embed via
+    the encoder, and write as first-class prior. Symbolic transparency:
+    the substrate discovers its own tool surface.
+    """
+    spaces = _parse_agent_md_env()
+    count = 0
+    for owner, repo, fname in spaces:
+        try:
+            url = f"https://huggingface.co/spaces/{owner}/{repo}/resolve/main/{fname}"
+            r = await client.get(
+                url,
+                headers={"User-Agent": "chainstate-priors/0.7.1"},
+                timeout=15.0,
+                follow_redirects=True,
+            )
+            if r.status_code != 200:
+                # Not every Space has an agent.md — 404s are normal, log quietly
+                if r.status_code != 404:
+                    print(f"[agent_md] {owner}/{repo}/{fname} → {r.status_code}", flush=True)
+                continue
+
+            # Byte cap
+            raw_bytes = r.content[:AGENT_MD_MAX_BYTES]
+            try:
+                full_text = raw_bytes.decode("utf-8", errors="replace")
+            except Exception:
+                continue
+
+            # Post-strip cap for encoder
+            text_for_embed = full_text[:AGENT_MD_STRIP_MAX]
+            if len(text_for_embed) < 100:
+                # Too short to be a useful agent.md
+                continue
+
+            vec = await embed(client, text_for_embed)
+            dist = compute_subspace_dist(text_for_embed)
+            content_hash = hashlib.sha256(full_text.encode("utf-8")).hexdigest()[:16]
+            summary_preview = _agent_md_summary(full_text)
+
+            title = f"{owner}/{repo} · {fname}"
+            space_url_guess = f"https://{owner.lower()}-{repo.lower().replace('.', '-')}.hf.space"
+            record = {
+                "source": "agent_md",
+                "title": title,
+                "summary": summary_preview[:1500],
+                "url": url,
+                "space_url": space_url_guess,
+                "space_owner": owner,
+                "space_repo": repo,
+                "filename": fname,
+                "content_hash": content_hash,
+                "full_text_len": len(full_text),
+                "subspace_dist": dist,
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "ingester_version": SERVICE_VER,
+            }
+            key_id = slug(f"{owner}-{repo}")
+            await kv.put(
+                client,
+                f"prior:agent_md:{key_id}",
+                json.dumps(record),
+                ttl_seconds=AGENT_MD_TTL,
+            )
+            if vec:
+                await kv.put(
+                    client,
+                    f"vec:agent_md:{key_id}",
+                    json.dumps({"vec": vec, "ts": record["ts"]}),
+                    ttl_seconds=AGENT_MD_TTL,
+                )
+            count += 1
+            await asyncio.sleep(0.15)
+        except Exception as e:
+            print(f"[agent_md] {owner}/{repo}: {e}", flush=True)
+    return count
+
 # ─── Orchestration ──────────────────────────────────────────────────────
 async def run_ingest_all() -> dict:
     if not (CF_ACCOUNT and CF_KV_NS and CF_TOKEN):
@@ -427,7 +579,7 @@ async def run_ingest_all() -> dict:
     kv = CFKV(CF_ACCOUNT, CF_KV_NS, CF_TOKEN)
     t0 = time.time()
     async with httpx.AsyncClient(follow_redirects=True) as client:
-        # Verify encoder is reachable first — no point ingesting if we can't embed
+        # Verify encoder is reachable first
         try:
             h = await client.get(f"{ENCODER_URL}/health", timeout=10.0)
             if h.status_code != 200:
@@ -438,6 +590,7 @@ async def run_ingest_all() -> dict:
         results = {}
         results["ecosystem"]    = await ingest_ecosystem_spaces(client, kv)
         results["researchgate"] = await ingest_researchgate(client, kv)
+        results["agent_md"]     = await ingest_agent_md(client, kv)      # NEW v0.7.1
         results["wikipedia"]    = await ingest_wikipedia(client, kv)
         results["arxiv"]        = await ingest_arxiv(client, kv)
     return {
@@ -466,7 +619,7 @@ def welcome():
     return {
         "service": "chainstate-priors",
         "version": SERVICE_VER,
-        "purpose": "Nightly corpus ingester — Wikipedia + arXiv + ecosystem HF Spaces + ResearchGate → Cloudflare KV",
+        "purpose": "Nightly corpus ingester — Wikipedia + arXiv + ecosystem HF Spaces + ResearchGate + agent.md (v0.7.1) → Cloudflare KV",
         "endpoints": [
             "GET  /              → this page",
             "GET  /health        → readiness + config status",
@@ -483,12 +636,13 @@ def health():
         "encoder_configured": bool(ENCODER_URL),
         "cloudflare_configured": bool(CF_ACCOUNT and CF_KV_NS and CF_TOKEN),
         "run_token_set": bool(RUN_TOKEN),
-        "sources": ["wikipedia", "arxiv", "ecosystem_hf_space", "researchgate"],
+        "sources": ["wikipedia", "arxiv", "ecosystem_hf_space", "researchgate", "agent_md"],
         "source_topic_counts": {
             "wikipedia": len(WIKIPEDIA_TOPICS),
             "arxiv_categories": len(ARXIV_CATEGORIES),
             "ecosystem_hf_spaces": len(ECOSYSTEM_HF_SPACES),
             "researchgate_publications": len(RESEARCHGATE_PUBLICATIONS),
+            "agent_md_spaces": len(_parse_agent_md_env()),
         },
     }
 
