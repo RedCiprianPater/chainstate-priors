@@ -61,7 +61,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.responses import JSONResponse
 
-SERVICE_VER  = "0.7.1-priors-agent-md-2026-07-16"
+SERVICE_VER  = "0.7.2-priors-genetic-mr-2026-07-17"
 ENCODER_URL  = os.getenv("ENCODER_URL",  "https://chainstate-encoder.onrender.com").rstrip("/")
 CF_ACCOUNT   = os.getenv("CLOUDFLARE_ACCOUNT_ID",  "")
 CF_KV_NS     = os.getenv("CLOUDFLARE_KV_NAMESPACE_ID",  "")
@@ -440,7 +440,9 @@ AGENT_MD_DEFAULTS = [
     ("CPater", "nwo-capital",       "agent.md"),
     ("CPater", "ornith-chainstate", "AGENT.md"),
     ("CPater", "nwo-rwa",           "agent.md"),
-    ("CPater", "nwo-mixed-reality", "agent.md"),
+    # ── v0.7.2 · newly integrated capability spaces ──
+    ("CPater", "nwo-genetic",       "agent.md"),   # biological foundry
+    ("CPater", "nwo-mixed-reality", "AGENT.md"),   # senses + simulation (uppercase per space)
 ]
 
 AGENT_MD_MAX_BYTES  = 500_000     # 500 KB body cap (same as worker FETCH)
