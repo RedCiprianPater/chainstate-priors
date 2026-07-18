@@ -61,7 +61,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.responses import JSONResponse
 
-SERVICE_VER  = "0.7.2-priors-genetic-mr-2026-07-17"
+SERVICE_VER  = "0.7.3-priors-live-2026-07-18"
 ENCODER_URL  = os.getenv("ENCODER_URL",  "https://chainstate-encoder.onrender.com").rstrip("/")
 CF_ACCOUNT   = os.getenv("CLOUDFLARE_ACCOUNT_ID",  "")
 CF_KV_NS     = os.getenv("CLOUDFLARE_KV_NAMESPACE_ID",  "")
@@ -422,6 +422,7 @@ async def ingest_researchgate(client: httpx.AsyncClient, kv: CFKV) -> int:
 
 # Default list: (owner, repo, filename). Overridden by env INGEST_AGENT_MD_SPACES.
 AGENT_MD_DEFAULTS = [
+    # ── (owner, repo, filename) → defaults source = "hf" (HuggingFace Space)
     ("CPater", "nwo-agentic",       "agent.md"),
     ("CPater", "nwo.apocalypse",    "agent.md"),
     ("CPater", "nwo-gateway",       "agent.md"),
@@ -443,6 +444,8 @@ AGENT_MD_DEFAULTS = [
     # ── v0.7.2 · newly integrated capability spaces ──
     ("CPater", "nwo-genetic",       "agent.md"),   # biological foundry
     ("CPater", "nwo-mixed-reality", "AGENT.md"),   # senses + simulation (uppercase per space)
+    # ── v0.7.3-live · GitHub-hosted infrastructure (source="github") ──
+    ("RedCiprianPater", "chainstate-anchor", "AGENT.md", "github"),  # on-chain anchor microservice
 ]
 
 AGENT_MD_MAX_BYTES  = 500_000     # 500 KB body cap (same as worker FETCH)
@@ -450,15 +453,33 @@ AGENT_MD_STRIP_MAX  = 20_000      # 20 KB post-strip cap before encoder
 AGENT_MD_TTL        = 30 * 86400  # 30 days — agent.md changes rarely
 
 def _parse_agent_md_env() -> list:
-    """Parse INGEST_AGENT_MD_SPACES env, fall back to defaults."""
+    """
+    Parse INGEST_AGENT_MD_SPACES env, fall back to defaults.
+    Each returned tuple is (owner, repo, filename, source) where source is
+    'hf' (HuggingFace Space, default) or 'github' (GitHub repo).
+
+    Env format examples:
+        CPater/nwo-cardiac                                → hf, agent.md
+        CPater/nwo-cardiac:AGENT.md                       → hf, AGENT.md
+        RedCiprianPater/chainstate-anchor:AGENT.md@github → github, AGENT.md
+    """
     raw = os.getenv("INGEST_AGENT_MD_SPACES", "").strip()
     if not raw:
-        return AGENT_MD_DEFAULTS
+        # Normalize defaults to 4-tuples (source defaults to "hf" when omitted)
+        return [(t[0], t[1], t[2], t[3] if len(t) > 3 else "hf") for t in AGENT_MD_DEFAULTS]
     result = []
     for entry in raw.split(","):
         entry = entry.strip()
         if not entry:
             continue
+        # Split off optional "@source" suffix
+        source = "hf"
+        if "@" in entry:
+            entry, source = entry.rsplit("@", 1)
+            source = source.strip().lower()
+            if source not in ("hf", "github"):
+                print(f"[agent_md] unknown source {source!r} in {entry!r}, defaulting to hf", flush=True)
+                source = "hf"
         # "owner/repo:file" or "owner/repo"
         if ":" in entry:
             path_part, fname = entry.rsplit(":", 1)
@@ -468,8 +489,10 @@ def _parse_agent_md_env() -> list:
             print(f"[agent_md] skipping malformed entry: {entry!r}", flush=True)
             continue
         owner, repo = path_part.split("/", 1)
-        result.append((owner.strip(), repo.strip(), fname.strip()))
-    return result or AGENT_MD_DEFAULTS
+        result.append((owner.strip(), repo.strip(), fname.strip(), source))
+    if not result:
+        return [(t[0], t[1], t[2], t[3] if len(t) > 3 else "hf") for t in AGENT_MD_DEFAULTS]
+    return result
 
 def _agent_md_summary(text: str, max_len: int = 500) -> str:
     """Extract first non-empty prose section after any YAML frontmatter."""
@@ -501,22 +524,33 @@ async def ingest_agent_md(client: httpx.AsyncClient, kv: CFKV) -> int:
     v0.7.1 · Fetch each Space's agent.md from HF /resolve/main/, embed via
     the encoder, and write as first-class prior. Symbolic transparency:
     the substrate discovers its own tool surface.
+
+    v0.7.3-live · Also supports GitHub-hosted AGENT.md via 'github' source
+    (see AGENT_MD_DEFAULTS 4-tuples). Uses raw.githubusercontent.com for
+    GitHub entries and the standard HF /resolve/main/ path for HF entries.
     """
     spaces = _parse_agent_md_env()
     count = 0
-    for owner, repo, fname in spaces:
+    for owner, repo, fname, source in spaces:
         try:
-            url = f"https://huggingface.co/spaces/{owner}/{repo}/resolve/main/{fname}"
+            # v0.7.3-live · URL varies by source
+            if source == "github":
+                url = f"https://raw.githubusercontent.com/{owner}/{repo}/main/{fname}"
+                space_url_guess = f"https://github.com/{owner}/{repo}"
+            else:
+                url = f"https://huggingface.co/spaces/{owner}/{repo}/resolve/main/{fname}"
+                space_url_guess = f"https://{owner.lower()}-{repo.lower().replace('.', '-')}.hf.space"
+
             r = await client.get(
                 url,
-                headers={"User-Agent": "chainstate-priors/0.7.1"},
+                headers={"User-Agent": "chainstate-priors/0.7.3-live"},
                 timeout=15.0,
                 follow_redirects=True,
             )
             if r.status_code != 200:
                 # Not every Space has an agent.md — 404s are normal, log quietly
                 if r.status_code != 404:
-                    print(f"[agent_md] {owner}/{repo}/{fname} → {r.status_code}", flush=True)
+                    print(f"[agent_md] {source}:{owner}/{repo}/{fname} → {r.status_code}", flush=True)
                 continue
 
             # Byte cap
@@ -538,9 +572,9 @@ async def ingest_agent_md(client: httpx.AsyncClient, kv: CFKV) -> int:
             summary_preview = _agent_md_summary(full_text)
 
             title = f"{owner}/{repo} · {fname}"
-            space_url_guess = f"https://{owner.lower()}-{repo.lower().replace('.', '-')}.hf.space"
             record = {
                 "source": "agent_md",
+                "origin": source,   # v0.7.3-live · distinguishes hf vs github origin
                 "title": title,
                 "summary": summary_preview[:1500],
                 "url": url,
@@ -554,7 +588,7 @@ async def ingest_agent_md(client: httpx.AsyncClient, kv: CFKV) -> int:
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "ingester_version": SERVICE_VER,
             }
-            key_id = slug(f"{owner}-{repo}")
+            key_id = slug(f"{source}-{owner}-{repo}")
             await kv.put(
                 client,
                 f"prior:agent_md:{key_id}",
